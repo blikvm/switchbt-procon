@@ -142,9 +142,7 @@ func (a *btAdapter) TrustDevice(deviceAddr string) error {
 	if err != nil {
 		return err
 	}
-	devicePath := dbus.ObjectPath("/org/bluez/hci0/dev_" + strings.ReplaceAll(strings.ToLower(deviceAddr), ":", "_"))
-	obj := a.conn.Object("org.bluez", devicePath)
-	return obj.Call("org.freedesktop.DBus.Properties.Set", 0, "org.bluez.Device1", "Trusted", dbus.MakeVariant(true)).Err
+	return exec.Command("bluetoothctl", "trust", deviceAddr).Run()
 }
 
 func parseBTAddress(addr string) ([6]byte, error) {
