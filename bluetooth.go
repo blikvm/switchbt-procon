@@ -145,6 +145,61 @@ func (a *btAdapter) TrustDevice(deviceAddr string) error {
 	return exec.Command("bluetoothctl", "trust", deviceAddr).Run()
 }
 
+// GetPairedDevices returns a list of paired bluetooth devices
+func (a *btAdapter) GetPairedDevices() ([]string, error) {
+	var devices []string
+	var managed map[dbus.ObjectPath]map[string]map[string]dbus.Variant
+	err := a.conn.Object("org.bluez", "/").Call("org.freedesktop.DBus.ObjectManager.GetManagedObjects", 0).Store(&managed)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, ifaces := range managed {
+		props, ok := ifaces["org.bluez.Device1"]
+		if !ok {
+			continue
+		}
+		paired, _ := props["Paired"].Value().(bool)
+		if !paired {
+			continue
+		}
+		address, _ := props["Address"].Value().(string)
+		name, _ := props["Name"].Value().(string)
+		if address != "" {
+			devices = append(devices, fmt.Sprintf("%s %s", address, name))
+		}
+	}
+	return devices, nil
+}
+
+// FindPairedSwitch returns the address of a paired Nintendo Switch device
+func (a *btAdapter) FindPairedSwitch() (string, error) {
+	var managed map[dbus.ObjectPath]map[string]map[string]dbus.Variant
+	err := a.conn.Object("org.bluez", "/").Call("org.freedesktop.DBus.ObjectManager.GetManagedObjects", 0).Store(&managed)
+	if err != nil {
+		return "", err
+	}
+
+	for _, ifaces := range managed {
+		props, ok := ifaces["org.bluez.Device1"]
+		if !ok {
+			continue
+		}
+		paired, _ := props["Paired"].Value().(bool)
+		if !paired {
+			continue
+		}
+		name, _ := props["Name"].Value().(string)
+		// Check if it's a Nintendo Switch (case insensitive)
+		if strings.Contains(strings.ToLower(name), "nintendo") ||
+			strings.Contains(strings.ToLower(name), "switch") {
+			address, _ := props["Address"].Value().(string)
+			return address, nil
+		}
+	}
+	return "", errors.New("no paired Nintendo Switch found")
+}
+
 func parseBTAddress(addr string) ([6]byte, error) {
 	var out [6]byte
 	parts := strings.Split(strings.TrimSpace(addr), ":")

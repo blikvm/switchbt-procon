@@ -16,13 +16,13 @@ import (
 func main() {
 	var socketPath string
 	var statePath string
-	var autoPair bool
+	var forcePair bool
 	var adapter string
 	var reconnectAddr string
 
 	flag.StringVar(&socketPath, "socket", "/tmp/switchbt-procon.sock", "unix socket path for IPC")
 	flag.StringVar(&statePath, "state", filepath.Join(os.TempDir(), "switchbt-procon-state.json"), "state file path")
-	flag.BoolVar(&autoPair, "auto-pair", false, "automatically start pairing on launch")
+	flag.BoolVar(&forcePair, "force-pair", false, "force enter pairing mode regardless of existing pairings")
 	flag.StringVar(&adapter, "adapter", "hci0", "bluetooth adapter name or address")
 	flag.StringVar(&reconnectAddr, "reconnect", "", "reconnect to a previously paired Switch bluetooth address")
 	flag.Parse()
@@ -64,8 +64,35 @@ func main() {
 		_ = srv.Shutdown(shutdownCtx)
 	}()
 
-	if autoPair || reconnectAddr != "" {
-		if err := daemon.Start(startRequest{Adapter: adapter, ReconnectAddr: reconnectAddr}); err != nil {
+	// Determine startup mode
+	autoStart := !forcePair && reconnectAddr == "" && flag.NFlag() == 0
+
+	if autoStart || forcePair || reconnectAddr != "" {
+		req := startRequest{Adapter: adapter, ReconnectAddr: reconnectAddr}
+		
+		if autoStart {
+			// Auto mode: check for paired Switch and reconnect if found
+			log.Printf("auto-start mode: checking for paired Switch devices")
+			btAdapter, err := openAdapter(adapter)
+			if err != nil {
+				log.Printf("failed to open adapter: %v", err)
+			} else {
+				switchAddr, err := btAdapter.FindPairedSwitch()
+				_ = btAdapter.Close()
+				if err == nil && switchAddr != "" {
+					log.Printf("found paired Switch: %s", switchAddr)
+					req.ReconnectAddr = switchAddr
+				} else {
+					log.Printf("no paired Switch found, entering pairing mode")
+					req.ReconnectAddr = ""
+				}
+			}
+		} else if forcePair {
+			log.Printf("force-pair mode: entering pairing mode")
+			req.ReconnectAddr = ""
+		}
+
+		if err := daemon.Start(req); err != nil {
 			log.Fatalf("autostart failed: %v", err)
 		}
 	}
