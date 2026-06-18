@@ -25,6 +25,12 @@ type sessionCallbacks struct {
 	onPaired    func(string)
 }
 
+type receivedPacket struct {
+	fd   int
+	name string
+	data []byte
+}
+
 type proControllerSession struct {
 	cfg       sessionConfig
 	cb        sessionCallbacks
@@ -209,6 +215,27 @@ func (s *proControllerSession) acceptAndRun(ctx context.Context) {
 		s.cb.onConnected(true, peer)
 	}
 	s.run(ctx)
+
+	// 当前这里还有bug，虚拟出来的蓝牙首次配对连接完后，当退出"Change Grip/Order"后，手柄会自动掉线，
+	//目前是先用再次重连兜底，后续再排查。
+	if peer == "" {
+		return
+	}
+	log.Printf("pairing session ended, auto-reconnecting to %s", peer)
+	s.closeChannels()
+	s.protocol.resetForReconnect()
+	time.Sleep(500 * time.Millisecond)
+	s.cfg.reconnectAddr = peer
+	if err := s.connectReconnect(); err != nil {
+		log.Printf("auto-reconnect failed: %v", err)
+		s.fail(err)
+		return
+	}
+	log.Printf("auto-reconnected to %s", peer)
+	if s.cb.onConnected != nil {
+		s.cb.onConnected(true, peer)
+	}
+	s.run(ctx)
 }
 
 func (s *proControllerSession) run(ctx context.Context) {
@@ -217,7 +244,7 @@ func (s *proControllerSession) run(ctx context.Context) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
-	defer s.cleanup()
+	defer s.closeChannels()
 	defer func() {
 		if s.cb.onConnected != nil {
 			s.cb.onConnected(false, "")
@@ -227,15 +254,43 @@ func (s *proControllerSession) run(ctx context.Context) {
 		}
 	}()
 
-	readCh := make(chan []byte, 8)
+	readCh := make(chan receivedPacket, 16)
 	errCh := make(chan error, 1)
-	go s.readLoop(readCh, errCh)
+
+	// The Switch sends output reports (subcommands) on the control channel
+	// (PSM 17) AND the interrupt channel (PSM 19). If we only read from the
+	// interrupt channel, the control channel's receive buffer fills up and
+	// the Switch blocks, unable to process our replies. Read from both.
+	var readWG sync.WaitGroup
+	readWG.Add(2)
+	go func() {
+		defer readWG.Done()
+		s.readLoopFD(s.ctlFD, "control", readCh)
+	}()
+	go func() {
+		defer readWG.Done()
+		s.readLoopFD(s.itrFD, "interrupt", readCh)
+	}()
+	go func() {
+		readWG.Wait()
+		select {
+		case errCh <- errors.New("bluetooth channels closed"):
+		default:
+		}
+	}()
 
 	emptyTicker := time.NewTicker(1 * time.Second)
 	defer emptyTicker.Stop()
 	stateTicker := time.NewTicker(15 * time.Millisecond)
 	defer stateTicker.Stop()
 	sentWakeups := 0
+
+	// Track the last time we received a subcommand. State reports (0x30)
+	// are paused for a short window after each subcommand so the reply
+	// doesn't get stuck behind a flood of 14-byte state reports in the
+	// L2CAP send buffer.
+	lastSubcmdTime := time.Time{}
+	const subcmdPause = 200 * time.Millisecond
 
 	if err := writeAll(s.itrFD, s.protocol.emptyReport()); err != nil {
 		s.fail(err)
@@ -254,17 +309,28 @@ func (s *proControllerSession) run(ctx context.Context) {
 				s.fail(err)
 			}
 			return
-		case data := <-readCh:
-			replies, err := s.protocol.handle(data)
+		case pkt := <-readCh:
+			log.Printf("rx on %s channel: %s", pkt.name, outputReportSummary(pkt.data))
+			replies, err := s.protocol.handle(pkt.data)
 			if err != nil {
 				log.Printf("protocol handle: %v", err)
 				continue
 			}
+			// Record the time so state reports are paused while the
+			// Switch processes our reply.
+			lastSubcmdTime = time.Now()
 			for _, reply := range replies {
-				if err := writeAll(s.itrFD, reply); err != nil {
+				// Send subcommand replies on the SAME channel the request
+				// came from. The Switch expects replies on the control
+				// channel when it sends the subcommand via SET_REPORT on
+				// PSM 17, and on the interrupt channel otherwise.
+				if err := writeAll(pkt.fd, reply); err != nil {
 					s.fail(err)
 					return
 				}
+				hexDump := make([]byte, len(reply))
+				copy(hexDump, reply)
+				log.Printf("sent reply: %d bytes on %s channel: % x", len(reply), pkt.name, hexDump[:min(20, len(hexDump))])
 			}
 		case <-emptyTicker.C:
 			if sentWakeups >= 10 || s.protocol.outputSeen {
@@ -277,14 +343,54 @@ func (s *proControllerSession) run(ctx context.Context) {
 			sentWakeups++
 			log.Printf("sent wakeup empty input report #%d", sentWakeups)
 		case <-stateTicker.C:
+			// Wait until SET_INPUT_REPORT_MODE (subcommand 0x03) has been
+			// received before streaming state reports. The Switch does not
+			// accept continuous 0x30 reports during the initial pairing
+			// handshake, and will close the interrupt channel if it sees
+			// them before the report mode has been negotiated.
 			if s.protocol.reportMode == 0 {
 				continue
 			}
-			if err := writeAll(s.itrFD, s.protocol.currentStateReport()); err != nil {
+			// Pause state reports for a short window after each subcommand
+			// so the reply isn't stuck behind a flood of 14-byte state
+			// reports in the L2CAP send buffer.
+			if time.Since(lastSubcmdTime) < subcmdPause {
+				continue
+			}
+			report := s.protocol.currentStateReport()
+			if err := writeAll(s.itrFD, report); err != nil {
 				s.fail(err)
 				return
 			}
+			log.Printf("sent state report: %d bytes", len(report))
 		}
+	}
+}
+
+func (s *proControllerSession) readLoopFD(fd int, name string, out chan<- receivedPacket) {
+	// Lock this goroutine to an OS thread to prevent Go runtime from
+	// interrupting system calls with SIGPROF signals during scheduling
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	buf := make([]byte, 1024)
+	for {
+		n, err := unix.Read(fd, buf)
+		if err != nil {
+			if errors.Is(err, unix.EINTR) {
+				log.Printf("%s channel read interrupted by signal (EINTR), retrying", name)
+				continue
+			}
+			log.Printf("%s channel read error: %v", name, err)
+			return
+		}
+		if n == 0 {
+			log.Printf("%s channel closed", name)
+			return
+		}
+		pkt := make([]byte, n)
+		copy(pkt, buf[:n])
+		out <- receivedPacket{fd: fd, name: name, data: pkt}
 	}
 }
 
@@ -327,16 +433,19 @@ func (s *proControllerSession) Close() error {
 	return nil
 }
 
-func (s *proControllerSession) cleanup() {
+func (s *proControllerSession) closeChannels() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
 	for _, fd := range []*int{&s.ctlFD, &s.itrFD, &s.ctlLFD, &s.itrLFD} {
 		if *fd >= 0 {
 			_ = unix.Close(*fd)
 			*fd = -1
 		}
 	}
+}
+
+func (s *proControllerSession) cleanup() {
+	s.closeChannels()
 	if s.adapter != nil {
 		_ = s.adapter.Discoverable(false)
 		_ = s.adapter.Pairable(false)
@@ -408,6 +517,13 @@ func writeAll(fd int, data []byte) error {
 		data = data[n:]
 	}
 	return nil
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func outputReportSummary(data []byte) string {

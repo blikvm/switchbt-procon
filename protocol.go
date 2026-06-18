@@ -31,6 +31,17 @@ func newControllerProtocol(localAddr [6]byte, flash *flashMemory) *controllerPro
 	}
 }
 
+// resetForReconnect clears the protocol state so the session can be reused
+// after a reconnect. Calibration data and flash contents are preserved.
+func (p *controllerProtocol) resetForReconnect() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.reportMode = 0
+	p.timer = 0
+	p.ready = false
+	p.outputSeen = false
+}
+
 func (p *controllerProtocol) setInput(in SwitchProConInput) {
 	p.mu.Lock()
 	p.input = in
@@ -94,7 +105,6 @@ func (p *controllerProtocol) handle(data []byte) ([][]byte, error) {
 	}
 	switch out.reportID() {
 	case 0x01:
-		log.Printf("rx %s", outputReportSummary(data))
 		return p.handleSubcommand(out)
 	case 0x10:
 		return nil, nil
@@ -157,9 +167,13 @@ func (p *controllerProtocol) handleSubcommand(out *outputReport) ([][]byte, erro
 		}
 		offset := int(data[0]) | int(data[1])<<8 | int(data[2])<<16 | int(data[3])<<24
 		size := int(data[4])
+		payload := p.flash.slice(offset, size)
+		log.Printf("spi flash read: offset=0x%08x requested=%d actual=%d flashLen=%d", offset, size, len(payload), len(p.flash.data))
 		r := reply(0x90, 0x10)
-		r.subSPIFlashRead(offset, p.flash.slice(offset, size))
-		return [][]byte{r.bytes()}, nil
+		r.subSPIFlashRead(offset, payload)
+		out := r.bytes()
+		log.Printf("spi flash reply: sent=%d bytes sizeByteInReport=%d", len(out), out[20])
+		return [][]byte{out}, nil
 	case 0x30:
 		p.mu.Lock()
 		wasReady := p.ready

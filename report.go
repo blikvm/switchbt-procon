@@ -74,8 +74,14 @@ func (r *inputReport) bytes() []byte {
 		return append([]byte(nil), r.data[:14]...)
 	case 0x31:
 		return append([]byte(nil), r.data[:363]...)
-	default:
+	case 0x21:
+		// All subcommand replies (report id 0x21) are 51 bytes on the
+		// wire. The Switch waits for the full 51 bytes before it will
+		// ack the corresponding output subcommand - sending 49 bytes
+		// causes it to keep retrying 0x21, 0x30, 0x40, 0x48 etc.
 		return append([]byte(nil), r.data[:51]...)
+	default:
+		return append([]byte(nil), r.data[:49]...)
 	}
 }
 
