@@ -144,8 +144,7 @@ curl --unix-socket /tmp/switchbt-procon.sock \
  
  go mod tidy
  
- CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
-   go build -trimpath -ldflags="-s -w" -o switchbt-procon
+ CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o switchbt-procon
 
 
 

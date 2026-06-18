@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"runtime"
 	"sync"
 	"time"
 
@@ -211,6 +212,11 @@ func (s *proControllerSession) acceptAndRun(ctx context.Context) {
 }
 
 func (s *proControllerSession) run(ctx context.Context) {
+	// Lock this goroutine to an OS thread to prevent Go runtime from
+	// interrupting system calls with SIGPROF signals during scheduling
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	defer s.cleanup()
 	defer func() {
 		if s.cb.onConnected != nil {
@@ -283,11 +289,20 @@ func (s *proControllerSession) run(ctx context.Context) {
 }
 
 func (s *proControllerSession) readLoop(out chan<- []byte, errCh chan<- error) {
+	// Lock this goroutine to an OS thread to prevent Go runtime from
+	// interrupting system calls with SIGPROF signals during scheduling
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	buf := make([]byte, 1024)
 	for {
 		n, err := unix.Read(s.itrFD, buf)
 		if err != nil {
-			errCh <- err
+			if errors.Is(err, unix.EINTR) {
+				log.Printf("read interrupted by signal (EINTR), retrying")
+				continue
+			}
+			errCh <- fmt.Errorf("read error: %w", err)
 			return
 		}
 		if n == 0 {
@@ -356,17 +371,6 @@ func listenL2CAP(local [6]byte, psm uint16) (int, error) {
 	return fd, nil
 }
 
-func acceptL2CAP(fd int) (int, string, error) {
-	nfd, sa, err := unix.Accept(fd)
-	if err != nil {
-		return -1, "", err
-	}
-	if l2, ok := sa.(*unix.SockaddrL2); ok {
-		return nfd, formatBTAddress(l2.Addr), nil
-	}
-	return nfd, "", nil
-}
-
 func connectL2CAP(remote [6]byte, psm uint16) (int, error) {
 	fd, err := unix.Socket(unix.AF_BLUETOOTH, unix.SOCK_SEQPACKET, unix.BTPROTO_L2CAP)
 	if err != nil {
@@ -379,11 +383,27 @@ func connectL2CAP(remote [6]byte, psm uint16) (int, error) {
 	return fd, nil
 }
 
+func acceptL2CAP(fd int) (int, string, error) {
+	nfd, sa, err := unix.Accept(fd)
+	if err != nil {
+		return -1, "", err
+	}
+	if l2, ok := sa.(*unix.SockaddrL2); ok {
+		return nfd, formatBTAddress(l2.Addr), nil
+	}
+	return nfd, "", nil
+}
+
 func writeAll(fd int, data []byte) error {
 	for len(data) > 0 {
 		n, err := unix.Write(fd, data)
 		if err != nil {
-			return err
+			// EINTR means the write was interrupted by a signal, retry
+			if errors.Is(err, unix.EINTR) {
+				log.Printf("write interrupted by signal, retrying")
+				continue
+			}
+			return fmt.Errorf("write error: %w", err)
 		}
 		data = data[n:]
 	}
