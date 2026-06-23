@@ -157,6 +157,26 @@ func (s *proControllerSession) preparePairing() error {
 }
 
 func (s *proControllerSession) connectReconnect() error {
+	connected, err := s.adapter.DeviceConnected(s.cfg.reconnectAddr)
+	if err != nil {
+		log.Printf("failed to query existing connection state for %s: %v", s.cfg.reconnectAddr, err)
+	} else if connected {
+		log.Printf("device %s is still marked connected, forcing disconnect before reconnect", s.cfg.reconnectAddr)
+		disconnectErr := s.adapter.DisconnectDevice(s.cfg.reconnectAddr)
+		if disconnectErr != nil {
+			log.Printf("disconnect via BlueZ failed for %s: %v", s.cfg.reconnectAddr, disconnectErr)
+		}
+		// Wait for the device to actually disconnect. If it doesn't
+		// (stale BlueZ state), power-cycle the adapter to clear it.
+		if waitErr := s.adapter.WaitDeviceDisconnected(s.cfg.reconnectAddr, 5*time.Second); waitErr != nil {
+			log.Printf("device did not disconnect cleanly, power-cycling adapter %s", s.cfg.adapter)
+			if resetErr := s.adapter.ResetAdapterConnectionState(s.cfg.reconnectAddr); resetErr != nil {
+				return fmt.Errorf("clear stale connection state: %w (disconnect error: %v)", resetErr, disconnectErr)
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
 	remote, err := parseBTAddress(s.cfg.reconnectAddr)
 	if err != nil {
 		return err
