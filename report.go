@@ -81,7 +81,9 @@ func (r *inputReport) bytes() []byte {
 		// causes it to keep retrying 0x21, 0x30, 0x40, 0x48 etc.
 		return append([]byte(nil), r.data[:51]...)
 	default:
-		return append([]byte(nil), r.data[:49]...)
+		// joycontrol uses a 51-byte zeroed input report as a reconnect
+		// wakeup packet before the Switch starts normal HID negotiation.
+		return append([]byte(nil), r.data[:51]...)
 	}
 }
 

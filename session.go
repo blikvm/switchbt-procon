@@ -38,13 +38,14 @@ type proControllerSession struct {
 	protocol  *controllerProtocol
 	localAddr [6]byte
 
-	mu     sync.Mutex
-	input  SwitchProConInput
-	ctlFD  int
-	itrFD  int
-	ctlLFD int
-	itrLFD int
-	stop   context.CancelFunc
+	mu              sync.Mutex
+	input           SwitchProConInput
+	ctlFD           int
+	itrFD           int
+	ctlLFD          int
+	itrLFD          int
+	stop            context.CancelFunc
+	agentRegistered bool
 }
 
 func newSession(cfg sessionConfig, cb sessionCallbacks) (*proControllerSession, error) {
@@ -86,12 +87,6 @@ func (s *proControllerSession) Start() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	s.stop = cancel
 
-	if err := registerAgent(s.adapter.conn); err != nil {
-		cancel()
-		return err
-	}
-	log.Printf("registered NoInputNoOutput agent")
-
 	if s.cfg.reconnectAddr != "" {
 		log.Printf("starting reconnect session adapter=%s target=%s", s.cfg.adapter, s.cfg.reconnectAddr)
 		if err := s.connectReconnect(); err != nil {
@@ -99,11 +94,6 @@ func (s *proControllerSession) Start() error {
 			return err
 		}
 		peer := s.cfg.reconnectAddr
-		if err := s.adapter.TrustDevice(peer); err != nil {
-			log.Printf("failed to trust device: %v", err)
-		} else {
-			log.Printf("trusted device %s", peer)
-		}
 		s.protocol.markPeer(peer)
 		if s.cb.onConnected != nil {
 			s.cb.onConnected(true, peer)
@@ -111,6 +101,13 @@ func (s *proControllerSession) Start() error {
 		go s.run(ctx)
 		return nil
 	}
+
+	if err := registerAgent(s.adapter.conn); err != nil {
+		cancel()
+		return err
+	}
+	s.agentRegistered = true
+	log.Printf("registered NoInputNoOutput agent")
 
 	log.Printf("starting pairing session adapter=%s", s.cfg.adapter)
 	if err := s.preparePairing(); err != nil {
@@ -284,6 +281,7 @@ func (s *proControllerSession) run(ctx context.Context) {
 	stateTicker := time.NewTicker(15 * time.Millisecond)
 	defer stateTicker.Stop()
 	sentWakeups := 0
+	reconnectMode := s.cfg.reconnectAddr != ""
 
 	// Track the last time we received a subcommand. State reports (0x30)
 	// are paused for a short window after each subcommand so the reply
@@ -292,12 +290,24 @@ func (s *proControllerSession) run(ctx context.Context) {
 	lastSubcmdTime := time.Time{}
 	const subcmdPause = 200 * time.Millisecond
 
-	if err := writeAll(s.itrFD, s.protocol.emptyReport()); err != nil {
-		s.fail(err)
-		return
+	// Pairing mode expects an immediate 0x30 wakeup. Bonded reconnects
+	// are more sensitive: match joycontrol by sending a neutral 51-byte
+	// HID input report until the Switch starts talking.
+	if reconnectMode {
+		if err := writeAll(s.itrFD, s.protocol.reconnectWakeupReport()); err != nil {
+			s.fail(err)
+			return
+		}
+		sentWakeups = 1
+		log.Printf("sent reconnect wakeup %d", sentWakeups)
+	} else {
+		if err := writeAll(s.itrFD, s.protocol.emptyReport()); err != nil {
+			s.fail(err)
+			return
+		}
+		sentWakeups = 1
+		log.Printf("sent initial empty input report")
 	}
-	sentWakeups = 1
-	log.Printf("sent initial empty input report")
 
 	for {
 		select {
@@ -310,7 +320,7 @@ func (s *proControllerSession) run(ctx context.Context) {
 			}
 			return
 		case pkt := <-readCh:
-			log.Printf("rx on %s channel: %s", pkt.name, outputReportSummary(pkt.data))
+			// log.Printf("rx on %s channel: %s", pkt.name, outputReportSummary(pkt.data))
 			replies, err := s.protocol.handle(pkt.data)
 			if err != nil {
 				log.Printf("protocol handle: %v", err)
@@ -336,12 +346,22 @@ func (s *proControllerSession) run(ctx context.Context) {
 			if sentWakeups >= 10 || s.protocol.outputSeen {
 				continue
 			}
-			if err := writeAll(s.itrFD, s.protocol.emptyReport()); err != nil {
+			var wakeup []byte
+			if reconnectMode {
+				wakeup = s.protocol.reconnectWakeupReport()
+			} else {
+				wakeup = s.protocol.emptyReport()
+			}
+			if err := writeAll(s.itrFD, wakeup); err != nil {
 				s.fail(err)
 				return
 			}
 			sentWakeups++
-			log.Printf("sent wakeup empty input report #%d", sentWakeups)
+			if reconnectMode {
+				log.Printf("sent reconnect wakeup %d", sentWakeups)
+			} else {
+				log.Printf("sent wakeup %d", sentWakeups)
+			}
 		case <-stateTicker.C:
 			// Wait until SET_INPUT_REPORT_MODE (subcommand 0x03) has been
 			// received before streaming state reports. The Switch does not
@@ -351,18 +371,16 @@ func (s *proControllerSession) run(ctx context.Context) {
 			if s.protocol.reportMode == 0 {
 				continue
 			}
-			// Pause state reports for a short window after each subcommand
-			// so the reply isn't stuck behind a flood of 14-byte state
-			// reports in the L2CAP send buffer.
+			// Pause state reports briefly after each subcommand to avoid
+			// flooding the Switch while it processes our reply.
 			if time.Since(lastSubcmdTime) < subcmdPause {
 				continue
 			}
-			report := s.protocol.currentStateReport()
-			if err := writeAll(s.itrFD, report); err != nil {
-				s.fail(err)
-				return
+			if err := writeAll(s.itrFD, s.protocol.currentStateReport()); err != nil {
+				log.Printf("state report write failed: %v", err)
+				// Don't fail immediately - try to recover
+				continue
 			}
-			log.Printf("sent state report: %d bytes", len(report))
 		}
 	}
 }
@@ -450,7 +468,10 @@ func (s *proControllerSession) cleanup() {
 		_ = s.adapter.Discoverable(false)
 		_ = s.adapter.Pairable(false)
 		_ = s.adapter.UnregisterProfile()
-		unregisterAgent(s.adapter.conn)
+		if s.agentRegistered {
+			unregisterAgent(s.adapter.conn)
+			s.agentRegistered = false
+		}
 		_ = s.adapter.Close()
 		s.adapter = nil
 	}

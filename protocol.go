@@ -94,6 +94,15 @@ func (p *controllerProtocol) emptyReport() []byte {
 	return r.bytes()
 }
 
+func (p *controllerProtocol) reconnectWakeupReport() []byte {
+	// Match joycontrol's initial reconnect wakeup: a default input report
+	// with only the 0xA1 HID input prefix and otherwise zero-filled bytes.
+	// The Switch may ignore or tear down the session if we start reconnect
+	// mode by sending a 0x30 state report before it begins HID negotiation.
+	r := newInputReport()
+	return r.bytes()
+}
+
 func (p *controllerProtocol) handle(data []byte) ([][]byte, error) {
 	p.mu.Lock()
 	p.outputSeen = true
