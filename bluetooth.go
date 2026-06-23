@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/godbus/dbus/v5"
 )
@@ -143,6 +144,94 @@ func (a *btAdapter) TrustDevice(deviceAddr string) error {
 		return err
 	}
 	return exec.Command("bluetoothctl", "trust", deviceAddr).Run()
+}
+
+func (a *btAdapter) findDevice(deviceAddr string) (dbus.ObjectPath, map[string]dbus.Variant, error) {
+	var managed map[dbus.ObjectPath]map[string]map[string]dbus.Variant
+	err := a.conn.Object("org.bluez", "/").Call("org.freedesktop.DBus.ObjectManager.GetManagedObjects", 0).Store(&managed)
+	if err != nil {
+		return "", nil, err
+	}
+
+	for path, ifaces := range managed {
+		props, ok := ifaces["org.bluez.Device1"]
+		if !ok {
+			continue
+		}
+		address, _ := props["Address"].Value().(string)
+		if strings.EqualFold(address, deviceAddr) {
+			return path, props, nil
+		}
+	}
+
+	return "", nil, fmt.Errorf("bluetooth device %q not found", deviceAddr)
+}
+
+func (a *btAdapter) DeviceConnected(deviceAddr string) (bool, error) {
+	_, props, err := a.findDevice(deviceAddr)
+	if err != nil {
+		return false, err
+	}
+	connected, _ := props["Connected"].Value().(bool)
+	return connected, nil
+}
+
+func (a *btAdapter) DisconnectDevice(deviceAddr string) error {
+	path, _, err := a.findDevice(deviceAddr)
+	if err != nil {
+		return err
+	}
+	// org.bluez.Device1.Disconnect takes no arguments.
+	err = a.conn.Object("org.bluez", path).Call("org.bluez.Device1.Disconnect", 0).Err
+	if err != nil {
+		msg := strings.ToLower(err.Error())
+		if strings.Contains(msg, `doesn't exist`) || strings.Contains(msg, "unknown method") {
+			out, cmdErr := exec.Command("bluetoothctl", "disconnect", deviceAddr).CombinedOutput()
+			connected, stateErr := a.DeviceConnected(deviceAddr)
+			if stateErr == nil && !connected {
+				return nil
+			}
+			if cmdErr != nil {
+				if len(out) > 0 {
+					return fmt.Errorf("bluetoothctl disconnect %s failed: %w: %s", deviceAddr, cmdErr, strings.TrimSpace(string(out)))
+				}
+				return fmt.Errorf("bluetoothctl disconnect %s failed: %w", deviceAddr, cmdErr)
+			}
+			return nil
+		}
+		if strings.Contains(msg, "not connected") || strings.Contains(msg, "failed") {
+			return nil
+		}
+	}
+	return err
+}
+
+func (a *btAdapter) WaitDeviceDisconnected(deviceAddr string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		connected, err := a.DeviceConnected(deviceAddr)
+		if err != nil {
+			return err
+		}
+		if !connected {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timeout waiting for %s to disconnect", deviceAddr)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+func (a *btAdapter) ResetAdapterConnectionState(deviceAddr string) error {
+	if err := a.Powered(false); err != nil {
+		return fmt.Errorf("power off adapter %s: %w", a.name, err)
+	}
+	time.Sleep(800 * time.Millisecond)
+	if err := a.Powered(true); err != nil {
+		return fmt.Errorf("power on adapter %s: %w", a.name, err)
+	}
+	return a.WaitDeviceDisconnected(deviceAddr, 5*time.Second)
 }
 
 // GetPairedDevices returns a list of paired bluetooth devices

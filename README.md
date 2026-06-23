@@ -153,5 +153,19 @@ curl --unix-socket /tmp/switchbt-procon.sock \
  sleep 1
  hciconfig hci0 up
  /usr/bin/dbus-daemon --system --fork --nopidfile
+ /etc/init.d/S40bluetoothd stop
  /usr/libexec/bluetooth/bluetoothd -n -d -P input &
  /userdata/server/bin/switchbt-procon --auto-pair --adapter hci0
+```
+
+> **注意**：`bluetoothd` 必须带 `-P input` 参数启动，禁用 BlueZ 内置的 input 插件。
+> 否则 BlueZ 会自动注册 HID profile 并占用 L2CAP PSM 17/19 端口，导致 switchbt-procon 绑定失败（`address already in use`）。
+>
+> **Buildroot 修改**：修改 `package/bluez5_utils/S40bluetoothd` 启动脚本中的参数：
+> ```bash
+> BLUETOOTHD_ARGS="-n -d -P input"
+> ```
+> 或在 `/etc/default/bluetoothd` 中覆盖：
+> ```bash
+> echo 'BLUETOOTHD_ARGS="-n -d -P input"' > /etc/default/bluetoothd
+> ```
